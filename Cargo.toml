@@ -1,0 +1,31 @@
+[package]
+name = "coxfitter"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.98"
+polars = { git = "https://github.com/hiroki-chen/polars.git", default-features = false, features = [
+  # "performant",
+  "fmt",
+  # "simd",
+  "lazy",
+  "polars-io",
+  "ipc",
+  # "ipc",
+  # "top_k",
+  # "streaming",
+  "dtype-categorical",
+  "round_series",
+  # "dtype-struct",
+  "parquet",
+  "to_dummies",
+  "is_in",
+  "temporal",
+  "cross_join",
+  "dtype-date",
+  "regex",
+  "strings",
+  "dtype-datetime",
+  # "semi_anti_join",
+] }
