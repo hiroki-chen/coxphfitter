@@ -8,29 +8,9 @@ doctest = false
 
 [dependencies]
 polars = { git = "https://github.com/hiroki-chen/polars.git", default-features = false, features = [
-  # "performant",
-  "fmt",
-  # "simd",
   "lazy",
-  "polars-io",
-  "ipc",
-  # "ipc",
-  # "top_k",
   "ndarray",
-  # "streaming",
-  "dtype-categorical",
-  "round_series",
-  # "dtype-struct",
   "parquet",
-  "to_dummies",
-  "is_in",
-  "temporal",
-  "cross_join",
-  "dtype-date",
-  "regex",
-  "strings",
-  "dtype-datetime",
-  # "semi_anti_join",
 ] }
 anyhow = "1.0.98"
 # Lock to "0.15.6" since polars are using this to avoid breaking changes.
