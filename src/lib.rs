@@ -1,7 +1,13 @@
 //! This crate implements a simple Cox proportional hazards model for survival analysis.
 
-use anyhow::Result;
-use polars::prelude::*;
+use anyhow::{anyhow, Result};
+use argmin::core::{CostFunction, Executor, Gradient, Hessian, Jacobian, Operator as ArgminOp};
+use argmin::solver::linesearch::condition::ArmijoCondition;
+use argmin::solver::linesearch::BacktrackingLineSearch;
+use argmin::solver::quasinewton::BFGS;
+use ndarray::prelude::*;
+use polars::frame::DataFrame;
+use polars::prelude::{Float64Type, IndexOrder};
 
 /// The input arguments for the Cox proportional hazards model.
 #[derive(Debug, Clone)]
@@ -104,23 +110,154 @@ impl<'a> Default for CoxPHFitterArgs<'a> {
 #[derive(Debug, Clone)]
 pub struct CoxPHFitter<'a> {
     args: CoxPHFitterArgs<'a>,
+    time_to_event: Option<Array1<f64>>,
+    event_indicator: Option<Array1<f64>>,
+    covariates_matrix: Option<Array2<f64>>,
 }
 
 impl<'a> CoxPHFitter<'a> {
     /// Creates a new instance of `CoxPHFitter` with the provided arguments.
     #[inline]
     pub fn new(args: CoxPHFitterArgs<'a>) -> Self {
-        Self { args }
+        Self {
+            args,
+            time_to_event: None,
+            event_indicator: None,
+            covariates_matrix: None,
+        }
     }
 
     /// Fit the Cox proportional hazard model to a dataset.
-    pub fn fit(&self, df: &DataFrame) -> Result<()> {
+    pub fn fit(&mut self, df: &DataFrame) -> Result<CoxPHResults> {
+        let time_array = df
+            .column(self.args.duration_col)?
+            .f64()?
+            .into_no_null_iter()
+            .collect::<Array1<f64>>();
+        let event_array = df
+            .column(self.args.event_col)?
+            .f64()?
+            .into_no_null_iter()
+            .collect::<Array1<f64>>();
+        let covariates_df = df.drop_many(&[self.args.duration_col, self.args.event_col]);
+        let num_covariates = covariates_df.width();
+        let covariates_array = covariates_df
+            .to_ndarray::<Float64Type>(IndexOrder::Fortran)?
+            // In general, using the Fortran-like index order is faster.
+            .into_shape((covariates_df.height(), num_covariates))
+            .map_err(|_| anyhow!("Failed to convert DataFrame to 2D ndarray"))?;
+
+        // Store data in the fitter for argmin
+        self.time_to_event = Some(time_array);
+        self.event_indicator = Some(event_array);
+        self.covariates_matrix = Some(covariates_array);
+
+        let initial_beta = Array1::<f64>::zeros(num_covariates);
+        let initial_inv_hessian = Array2::<f64>::eye(num_covariates);
+        let solver = BFGS::new(BacktrackingLineSearch::new(
+            ArmijoCondition::new(1e-4).unwrap(),
+        ));
+
+        let res = Executor::new(self.clone(), solver) // Clone self because Executor takes ownership of Op
+            .configure(|state| {
+                state
+                    .param(initial_beta)
+                    .inv_hessian(initial_inv_hessian)
+                    .max_iters(1000)
+                    .target_cost(1e-6)
+            }) // Increased max_iters, added target_cost
+            .run()?;
+
+        // --- Extract and Process Results ---
+        let final_beta = res.state.param.unwrap(); // Optimized coefficients
+        let final_log_likelihood = -res.state.cost; // `argmin` minimizes cost, so take negative for log-likelihood
+        let num_iterations = res.state.iter;
+
+        Ok(CoxPHResults {
+            coefficients: final_beta,
+            num_iterations,
+            final_log_likelihood,
+            ..Default::default()
+        })
+    }
+}
+
+impl<'a> ArgminOp for CoxPHFitter<'a> {
+    type Param = Array1<f64>;
+
+    // The negative penalized partial log-likelihood
+    type Output = f64;
+
+    fn apply(&self, param: &Self::Param) -> Result<Self::Output> {
+        // Retrieve data from self.
+        // Unwrap is fine here because `fit` method will ensure these are `Some`.
+        let time_to_event = self.time_to_event.as_ref().unwrap();
+        let event_indicator = self.event_indicator.as_ref().unwrap();
+        let covariates_matrix = self.covariates_matrix.as_ref().unwrap();
+
+        unimplemented!("CoxPHFitter::apply is not implemented yet");
+    }
+}
+
+impl<'a> CostFunction for CoxPHFitter<'a> {
+    type Param = Array1<f64>;
+
+    type Output = f64;
+
+    fn cost(&self, param: &Self::Param) -> Result<Self::Output> {
+        todo!()
+    }
+}
+
+impl<'a> Hessian for CoxPHFitter<'a> {
+    type Hessian = Array2<f64>;
+    type Param = Array1<f64>;
+
+    fn hessian(&self, param: &Self::Param) -> Result<Self::Hessian> {
+        unimplemented!("CoxPHFitter::hessian is not implemented yet");
+    }
+}
+
+impl<'a> Jacobian for CoxPHFitter<'a> {
+    // Not used for this type of problem
+    type Jacobian = ();
+    type Param = Array1<f64>;
+
+    fn jacobian(&self, _param: &Self::Param) -> Result<Self::Jacobian> {
         Ok(())
     }
 }
 
+impl<'a> Gradient for CoxPHFitter<'a> {
+    type Gradient = Array1<f64>;
+    type Param = Array1<f64>;
+
+    fn gradient(&self, param: &Self::Param) -> Result<Self::Gradient> {
+        unimplemented!("CoxPHFitter::gradient is not implemented yet");
+    }
+}
+
+/// Represents the fitted Cox Proportional Hazards Model results.
+#[derive(Default, Debug)]
+pub struct CoxPHResults {
+    pub coefficients: Array1<f64>,
+    pub hazard_ratios: Array1<f64>,
+    pub standard_errors: Array1<f64>,
+    pub p_values: Array1<f64>,
+    pub log_likelihood: f64,
+    pub num_iterations: u64,
+    pub convergence_succeeded: bool,
+    pub covariate_names: Vec<String>,
+    pub final_log_likelihood: f64,
+    // You might also store the baseline hazard/survival function here
+    // pub baseline_hazard: Vec<(f64, f64)>, // (time, hazard)
+    // pub baseline_survival: Vec<(f64, f64)>, // (time, survival_probability)
+}
+
 #[cfg(test)]
 mod test {
+    use polars::prelude::LazyFrame;
+
     use super::*;
 
     const TEST_DF_PATH: &str = "./data/cox_data.parquet";
@@ -132,7 +269,7 @@ mod test {
             .set_duration_col("T")
             .set_penalizer(0.1)
             .set_robust(true);
-        let fitter = CoxPHFitter::new(args);
+        let mut fitter = CoxPHFitter::new(args);
 
         // Load a test DataFrame (this is a placeholder, replace with actual DataFrame loading logic)
         let df = LazyFrame::scan_parquet(TEST_DF_PATH, Default::default())

@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-anyhow = "1.0.98"
 polars = { git = "https://github.com/hiroki-chen/polars.git", default-features = false, features = [
   # "performant",
   "fmt",
@@ -14,6 +13,7 @@ polars = { git = "https://github.com/hiroki-chen/polars.git", default-features =
   "ipc",
   # "ipc",
   # "top_k",
+  "ndarray",
   # "streaming",
   "dtype-categorical",
   "round_series",
@@ -29,3 +29,11 @@ polars = { git = "https://github.com/hiroki-chen/polars.git", default-features =
   "dtype-datetime",
   # "semi_anti_join",
 ] }
+anyhow = "1.0.98"
+# Lock to "0.15.6" since polars are using this to avoid breaking changes.
+ndarray = "0.15.6"
+# The version on crates.io is problematic; we lock to a specific commit.
+argmin = { git = "https://github.com/argmin-rs/argmin.git", rev = "d4f20b7" }
+argmin-math = { git = "https://github.com/argmin-rs/argmin.git", features = [
+  "ndarray_latest-nolinalg", # linalg will cause linkage failure
+], rev = "d4f20b7" }
