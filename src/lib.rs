@@ -1,25 +1,36 @@
 //! This crate implements a simple Cox proportional hazards model for survival analysis.
+//! does not work.
+//!
+//! Try survival-rust first.
 
 #![allow(non_snake_case)]
 
+pub(crate) mod math;
+
 use anyhow::{anyhow, Result};
-use argmin::core::{CostFunction, Executor, Gradient, Hessian, Jacobian, Operator as ArgminOp};
-use argmin::solver::linesearch::condition::ArmijoCondition;
-use argmin::solver::linesearch::BacktrackingLineSearch;
-use argmin::solver::quasinewton::BFGS;
+use math::{elastic_net_penalty, StepSizer};
 use ndarray::prelude::*;
+use ndarray_einsum_beta::einsum;
+use ndarray_linalg::*;
 use polars::frame::DataFrame;
-use polars::prelude::{DataType, Float64Type, IndexOrder};
+use polars::prelude::*;
+
+#[derive(Debug, Clone)]
+pub struct Coefficient {
+    /// The coefficient
+    pub coef: f64,
+    /// Thwe exponentiated coefficient value estimate
+    pub exp_coef: f64,
+    /// The standard error of the coefficient estimate
+    pub se_coef: f64,
+    /// The Z statistic, which is the ratio of the coefficient estimate to its standard error
+    pub z: f64,
+}
 
 /// The input arguments for the Cox proportional hazards model.
 #[derive(Debug, Clone)]
 pub struct CoxPHFitterArgs<'a> {
     /// Attach a penalty to the size of the coefficients during regression.
-    /// This improves stability of the estimates and controls for high correlation between covariates.
-    ///
-    /// ```tex
-    ///     $penalizer(\dfrac{1 - l1\_ratio}{2} || \beta ||^{2}_{2} + l1\_ratio ||\beta||_1 )$
-    /// ```
     pub penalizer: f64,
     /// Specify how the fitter should estimate the baseline.
     pub baseline_estimation_method: &'a str,
@@ -31,6 +42,10 @@ pub struct CoxPHFitterArgs<'a> {
     pub event_col: &'a str,
     /// The columns to use as covariates in the model.
     pub robust: bool,
+    /// Smoothing parameter for the soft_abs function in L1 penalty.
+    pub a_param_soft_abs: f64,
+    /// Max iteration
+    pub max_iter: usize,
 }
 
 impl<'a> CoxPHFitterArgs<'a> {
@@ -42,6 +57,7 @@ impl<'a> CoxPHFitterArgs<'a> {
         duration_col: &'a str,
         event_col: &'a str,
         robust: bool,
+        max_iter: usize,
     ) -> Self {
         Self {
             penalizer,
@@ -50,6 +66,8 @@ impl<'a> CoxPHFitterArgs<'a> {
             duration_col,
             event_col,
             robust,
+            a_param_soft_abs: 100.0, // Default smoothing parameter for L1
+            max_iter,
         }
     }
 
@@ -82,55 +100,79 @@ impl<'a> CoxPHFitterArgs<'a> {
         self.robust = robust;
         self
     }
+
+    pub fn set_a_param_soft_abs(mut self, a_param: f64) -> Self {
+        self.a_param_soft_abs = a_param;
+        self
+    }
+
+    pub fn set_max_iter(mut self, max_iter: usize) -> Self {
+        self.max_iter = max_iter;
+        self
+    }
 }
 
 impl<'a> Default for CoxPHFitterArgs<'a> {
     fn default() -> Self {
-        Self::new(
-            // Default values for the CoxPHFitterArgs
-            0.0,        // penalizer
-            "breslow",  // baseline_estimation_method
-            0.0,        // l1_ratio
-            "duration", // duration_col
-            "event",    // event_col
-            false,      // robust
-        )
+        Self::new(0.0, "breslow", 0.0, "duration", "event", false, 500)
     }
 }
 
 /// This class implements fitting Cox’s proportional hazard model.
 ///
-/// ```tex
-///     $h(t \mid x) = h_0(t) \exp((x \overline{x})'\beta)$
-/// ```
+/// Cox proportional hazards models are the most widely used approach to modeling time to even data.
+/// The hazard function computes the instantaneous rate of an event occurrence, written $h(t)$.
 ///
-/// The baseline hazard can be modeled in two ways:
-///
-/// 1. (default) non-parametrically, using Breslow’s method. In this case, the entire model is the
-///     traditional semi-parametric Cox model. Ties are handled using Efron’s method.
-/// 2. parametrically, using a pre-specified number of cubic splines, or piecewise values. (on-going work)
+/// The hazard function for aobservation $i$ in a Cox PH model is defined as ℎ𝑖(𝑡)=𝜆(𝑡)exp(𝐱𝑇𝑖𝛽)
 #[derive(Debug, Clone)]
 pub struct CoxPHFitter<'a> {
     args: CoxPHFitterArgs<'a>,
     time_to_event: Option<Array1<f64>>,
-    event_indicator: Option<Array1<f64>>,
+    event_indicator: Option<Array1<f64>>, // Should store bool or 0/1
     covariates_matrix: Option<Array2<f64>>,
+    // Store sorted indices and original data to avoid repeated sorting if data doesn't change
+    // These would be populated during a `preprocess` step or at the start of `fit`
+    sorted_original_indices: Option<Vec<usize>>,
+}
+
+/// Represents the fitted Cox Proportional Hazards Model results.
+#[derive(Default, Debug, Clone)]
+pub struct CoxPHResults {
+    /// The coefficients are a list of the estimated coefficients for each covariate in the model.
+    /// We also store the standard eror of the coefficient estimate.
+    pub coefficients: Array1<f64>,
+    pub hazard_ratios: Array1<f64>,
+    pub standard_errors: Array1<f64>,
+    pub p_values: Array1<f64>,
+    pub log_likelihood: f64, // Actual log-likelihood (not negative)
+    pub num_iterations: u64,
+    pub convergence_succeeded: bool, // Placeholder, argmin result doesn't directly give this boolean
+    pub covariate_names: Vec<String>, // Placeholder
+    pub final_log_likelihood: f64,   // Kept for compatibility, same as log_likelihood
+}
+
+pub struct CoxProcessedDf {
+    /// The time to event column, converted to an Array1<f64>
+    time_array: Array1<f64>,
+    /// The event indicator column, converted to an Array1<i32>
+    event_array: Array1<i32>,
+    /// The covariates matrix, converted to an Array2<f64>
+    covariates: Array2<f64>,
+    /// Weights.
+    weights: Array1<f64>,
 }
 
 impl<'a> CoxPHFitter<'a> {
-    /// Creates a new instance of `CoxPHFitter` with the provided arguments.
-    #[inline]
-    pub fn new(args: CoxPHFitterArgs<'a>) -> Self {
-        Self {
-            args,
-            time_to_event: None,
-            event_indicator: None,
-            covariates_matrix: None,
-        }
-    }
+    fn preprocess(&self, df: &DataFrame) -> Result<CoxProcessedDf> {
+        let df = df.sort(
+            [self.args.duration_col],
+            SortMultipleOptions::new().with_order_descending(false),
+        )?;
 
-    /// Fit the Cox proportional hazard model to a dataset.
-    pub fn fit(&mut self, df: &DataFrame) -> Result<CoxPHResults> {
+        // This function should convert the DataFrame to the required format
+        // and return a CoxProcessedDf with time_col, event_col, and covariates.
+        // It should also sort the data and store the original indices.
+
         let time_array = df
             .column(self.args.duration_col)?
             .cast(&DataType::Float64)?
@@ -139,332 +181,290 @@ impl<'a> CoxPHFitter<'a> {
             .collect::<Array1<f64>>();
         let event_array = df
             .column(self.args.event_col)?
-            .cast(&DataType::Float64)?
-            .f64()?
+            .cast(&DataType::Int32)? // Assuming event is 1 / 0
+            .i32()?
             .into_no_null_iter()
-            .collect::<Array1<f64>>();
-        let covariates_df = df.drop_many(&[self.args.duration_col, self.args.event_col]);
-        let num_covariates = covariates_df.width();
-        let covariates_array = covariates_df
+            .collect::<Array1<i32>>();
+        let covariates = df
+            .drop_many(&[self.args.duration_col, self.args.event_col])
             .to_ndarray::<Float64Type>(IndexOrder::Fortran)?
-            // In general, using the Fortran-like index order is faster.
-            .into_shape((covariates_df.height(), num_covariates))
-            .map_err(|_| anyhow!("Failed to convert DataFrame to 2D ndarray"))?;
+            .into_shape((df.height(), df.width() - 2))
+            .map_err(|e| anyhow!("Failed to convert DataFrame to 2D ndarray: {}", e))?;
 
-        // Store data in the fitter for argmin
-        self.time_to_event = Some(time_array);
-        self.event_indicator = Some(event_array);
-        self.covariates_matrix = Some(covariates_array);
-
-        let initial_beta = Array1::<f64>::zeros(num_covariates);
-        let initial_inv_hessian = Array2::<f64>::eye(num_covariates);
-        let solver = BFGS::new(BacktrackingLineSearch::new(
-            ArmijoCondition::new(1e-4).unwrap(),
-        ));
-
-        let res = Executor::new(self.clone(), solver) // Clone self because Executor takes ownership of Op
-            .configure(|state| {
-                state
-                    .param(initial_beta)
-                    .inv_hessian(initial_inv_hessian)
-                    .max_iters(1000)
-                    .target_cost(1e-6)
-            }) // Increased max_iters, added target_cost
-            .run()?;
-
-        // --- Extract and Process Results ---
-        let final_beta = res.state.param.unwrap(); // Optimized coefficients
-        let final_log_likelihood = -res.state.cost; // `argmin` minimizes cost, so take negative for log-likelihood
-        let num_iterations = res.state.iter;
-
-        Ok(CoxPHResults {
-            coefficients: final_beta,
-            num_iterations,
-            final_log_likelihood,
-            ..Default::default()
+        Ok(CoxProcessedDf {
+            weights: Array1::<f64>::ones(time_array.len()),
+            time_array,
+            event_array,
+            covariates,
         })
     }
-}
 
-impl<'a> ArgminOp for CoxPHFitter<'a> {
-    type Param = Array1<f64>;
+    /// Returns
+    /// - hessian (d, d) array
+    /// - gradient (1, d) array
+    /// - log_likelihood: f64
+    ///
+    /// Calculates the first and second order vector differentials, with respect to beta.
+    /// Note that X, T, E are assumed to be sorted on T!
+    ///
+    ///  A good explanation for Efron. Consider three of five subjects who fail at the same time.
+    ///  As it is not known a priori that who is the first to fail, so one-third of
+    ///     (φ1 + φ2 + φ3) is adjusted from sum_j^{5} φj after one fails. Similarly two-third
+    ///     of (φ1 + φ2 + φ3) is adjusted after first two individuals fail, etc.
+    fn get_efron_values(
+        &self,
+        X: &Array2<f64>,
+        T: &Array1<f64>,
+        E: &Array1<i32>,
+        weights: &Array1<f64>,
+        beta: &Array1<f64>,
+    ) -> (Array2<f64>, Array1<f64>, f64) {
+        let shape = X.shape();
+        let (n, d) = (shape[0], shape[1]);
+        let mut hessian = Array2::<f64>::zeros((d, d));
+        let mut gradient = Array1::<f64>::zeros(d);
+        let mut log_lik = 0.0;
 
-    // The negative penalized partial log-likelihood
-    type Output = f64;
+        // Init risk and tie sums to zero
+        let mut x_death_sum = Array1::<f64>::zeros(d);
+        let (mut risk_phi, mut tie_phi) = (0.0, 0.0);
+        let (mut risk_phi_x, mut tie_phi_x) = (Array1::<f64>::zeros(d), Array1::<f64>::zeros(d));
+        let (mut risk_phi_x_x, mut tie_phi_x_x) =
+            (Array2::<f64>::zeros((d, d)), Array2::<f64>::zeros((d, d)));
 
-    fn apply(&self, param: &Self::Param) -> Result<Self::Output> {
-        // Retrieve data from self.
-        // Unwrap is fine here because `fit` method will ensure these are `Some`.
-        let time_to_event = self.time_to_event.as_ref().unwrap();
-        let event_indicator = self.event_indicator.as_ref().unwrap();
-        let covariates_matrix = self.covariates_matrix.as_ref().unwrap();
+        // Init number of ties and weights
+        let mut weight_count = 0.0;
+        let mut tied_death_counts = 0;
+        let scores = math::exp(&(weights * X.dot(beta)));
 
-        let num_observations = time_to_event.len();
-        let mut neg_log_likelihood = 0.0;
+        let phi_x_is = scores.clone().insert_axis(Axis(1)) * X;
+        // let mut phi_x_x_i = Array2::<f64>::zeros((d, d));
 
-        // Iterate through unique event times to build risk sets
-        // This is a simplified loop, proper handling of tied events (Breslow/Efron)
-        // is crucial here and impacts gradient/hessian too.
-        let mut sorted_indices: Vec<usize> = (0..num_observations).collect();
-        sorted_indices.sort_by(|&a, &b| time_to_event[a].partial_cmp(&time_to_event[b]).unwrap());
+        // Iterate backwards to utilize recursive relationship
+        for i in n - 1..=0 {
+            let ti = T[i];
+            let ei = E[i];
+            let xi = X.row(i);
+            let w = weights[i];
 
-        for &i in sorted_indices.iter() {
-            if event_indicator[i] == 1.0 {
-                // Only consider observed events
-                let current_time = time_to_event[i];
+            // Calculate phi values.
+            let phi_i = scores[i];
+            let phi_x_i = phi_x_is.row(i);
+            let phi_x_x_i = math::outer_product(xi, phi_x_i);
 
-                // Calculate risk set for the current event time
-                // Risk set includes all individuals whose time_to_event >= current_time
-                let risk_set_indices: Vec<usize> = (0..num_observations)
-                    .filter(|&j| time_to_event[j] >= current_time)
-                    .collect();
+            // Calculate sums of risk set
+            risk_phi += &phi_i;
+            risk_phi_x += &phi_x_i;
+            risk_phi_x_x += &phi_x_x_i;
 
-                let numerator_sum = (covariates_matrix.row(i).to_owned().dot(param)).exp();
+            // Calculate sums of Ties, if this is an event
+            if ei != 0 {
+                x_death_sum += &xi.mapv(|v| w * v);
+                tie_phi += &phi_i;
+                tie_phi_x += &phi_x_i;
+                tie_phi_x_x += &phi_x_x_i;
 
-                let mut denominator_sum = 0.0;
-                for &k_idx in risk_set_indices.iter() {
-                    denominator_sum += (covariates_matrix.row(k_idx).to_owned().dot(param)).exp();
-                }
-
-                // Add to negative log-likelihood (for maximization, we minimize negative)
-                if denominator_sum > 0.0 {
-                    neg_log_likelihood -= (numerator_sum / denominator_sum).ln();
-                }
+                //  Keep track of count
+                tied_death_counts += 1;
+                weight_count += w;
             }
+
+            if i > 0 && T[i - 1] == ti {
+                // There are more ties/members of the risk set
+                continue;
+            } else if tied_death_counts == 0 {
+                // Only censored with current time, move on
+                continue;
+            }
+
+            // There was at least one event and no more ties remain. Time to sum.
+            let weighted_average = weight_count / tied_death_counts as f64;
+
+            if tied_death_counts > 1 {
+                let increasing_proportion = Array1::<i32>::from_iter(0..tied_death_counts)
+                    .mapv(|v| v as f64)
+                    / tied_death_counts as f64;
+                let denom = 1.0 / (risk_phi - &increasing_proportion * tie_phi);
+                let numer = &risk_phi_x
+                    - math::outer_product(increasing_proportion.view(), tie_phi_x.view());
+                let a1 = (einsum("ab,i->ab", &[&risk_phi_x_x, &denom]).unwrap()
+                    - einsum("ab,i->ab", &[&tie_phi_x_x, &increasing_proportion]).unwrap())
+                .into_dimensionality::<Ix2>()
+                .unwrap();
+
+                let summand = numer * denom.clone().insert_axis(Axis(1));
+                let a2 = summand.t().dot(&summand);
+
+                gradient = gradient + &x_death_sum - weighted_average * summand.sum();
+                log_lik = log_lik
+                    + &x_death_sum.dot(beta)
+                    + &weighted_average * &denom.mapv(|v| v.ln()).sum();
+                hessian = hessian + weighted_average * (a2 - a1);
+            } else {
+                let denom = 1.0 / arr1(&[risk_phi]);
+                let numer = &risk_phi_x;
+                let a1 = &risk_phi_x_x * &denom;
+
+                let summand = numer * &denom.clone().insert_axis(Axis(1));
+                let a2 = summand.t().dot(&summand);
+
+                gradient = gradient + &x_death_sum - weighted_average * summand.sum();
+                log_lik = log_lik
+                    + x_death_sum.dot(beta)
+                    + weighted_average * &denom.mapv(|v| v.ln()).sum();
+                hessian = hessian + weighted_average * (a2 - a1);
+            };
+
+            // reset tie values
+            tied_death_counts = 0;
+            weight_count = 0.0;
+            x_death_sum.fill(0.0);
+            tie_phi = 0.0;
+            tie_phi_x.fill(0.0);
+            tie_phi_x_x.fill(0.0);
         }
 
-        // Add penalization (L1 and L2 terms)
-        let l1_penalty = param.mapv(f64::abs).sum();
-        let l2_penalty = param.dot(param); // ||beta||^2_2
-
-        let penalty_term = self.args.penalizer
-            * ((1.0 - self.args.l1_ratio) / 2.0 * l2_penalty + self.args.l1_ratio * l1_penalty);
-
-        Ok(neg_log_likelihood + penalty_term)
+        (hessian, gradient, log_lik)
     }
-}
-impl<'a> CostFunction for CoxPHFitter<'a> {
-    type Param = Array1<f64>;
-    type Output = f64;
 
-    fn cost(&self, param: &Self::Param) -> Result<Self::Output> {
-        let time_to_event = self.time_to_event.as_ref().unwrap();
-        let event_indicator = self.event_indicator.as_ref().unwrap();
-        let covariates_matrix = self.covariates_matrix.as_ref().unwrap();
+    /// Newton Raphson algorithm for fitting CPH model.
+    ///
+    /// The data is assumed to be sorted on T!
+    ///
+    /// Return beta: (1,d) numpy array.
+    fn newton_raphson_for_efron_model(
+        &self,
+        X: &Array2<f64>,
+        T: &Array1<f64>,
+        E: &Array1<i32>,
+        weights: &Array1<f64>,
+        step_size: f64,
+        precision: f64,
+        r_precision: f64,
+        max_iter: usize,
+    ) -> (Array1<f64>, f64, Array2<f64>) {
+        let shape = X.shape();
+        let (n, d) = (shape[0], shape[1]);
 
-        let num_observations = time_to_event.len();
-        let mut neg_log_likelihood = 0.0;
+        let mut beta = Array1::<f64>::zeros(d);
 
-        // Create a sorted list of indices based on time_to_event
-        let mut sorted_indices: Vec<usize> = (0..num_observations).collect();
-        sorted_indices.sort_by(|&a, &b| time_to_event[a].partial_cmp(&time_to_event[b]).unwrap());
+        let mut step_sizer = StepSizer::new(step_size);
+        let mut step_size = step_sizer.next();
 
-        for &i in sorted_indices.iter() {
-            if event_indicator[i] == 1.0 {
-                // Only consider events
-                let current_time = time_to_event[i];
+        let mut delta = Array1::<f64>::zeros(d);
+        let mut converging = true;
+        let mut ll_ = 0.0;
+        let mut previous_ll_ = 0.0;
+        let mut i = 0; // iteration.
+        let mut hessian = Array2::<f64>::zeros((d, d));
 
-                // Determine the risk set: all individuals alive at or after current_time
-                let risk_set_indices: Vec<usize> = (0..num_observations)
-                    .filter(|&j| time_to_event[j] >= current_time)
-                    .collect();
+        while converging {
+            beta.scaled_add(step_size, &delta);
 
-                let numerator_exp_beta_x = (covariates_matrix.row(i).dot(param)).exp();
+            i += 1;
 
-                let mut denominator_sum_exp_beta_x = 0.0;
-                for &k_idx in risk_set_indices.iter() {
-                    denominator_sum_exp_beta_x += (covariates_matrix.row(k_idx).dot(param)).exp();
-                }
+            // Because we do not have strata, we can directly get gradient from X, T, E, weights, entries, and beta.
+            let (h, g, ll__) = self.get_efron_values(X, T, E, weights, &beta);
+            ll_ = ll__;
 
-                if denominator_sum_exp_beta_x <= 0.0 {
-                    // Return a very large value to push optimizer away from this degenerate region
-                    return Ok(f64::INFINITY);
-                }
-                neg_log_likelihood -= (numerator_exp_beta_x / denominator_sum_exp_beta_x).ln();
+            if self.args.penalizer > 0.0 {
+                ll_ -= elastic_net_penalty(
+                    &beta,
+                    1.3f64.powf(i as _),
+                    n as _,
+                    self.args.penalizer,
+                    self.args.l1_ratio,
+                );
+                // g -= d_elastic_net_penalty(beta, 1.3**i)
+                // h[np.diag_indices(d)] -= dd_elastic_net_penalty(beta, 1.3**i)
             }
+
+            
+
+            let inv_h_dot_g_T = (-&h).solve(&g).unwrap();
+            delta = inv_h_dot_g_T.clone();
+
+            // save these as pending result
+            hessian = h.clone();
+
+            let norm_delta = if delta.len() > 0 { delta.norm() } else { 0.0 };
+
+            // reusing an above piece to make g * inv(h) * g.T faster.
+            let newton_decrement = g.dot(&inv_h_dot_g_T) / 2.0;
+
+            if norm_delta < precision {
+                converging = false;
+            } else if previous_ll_ != 0.0
+                && (ll_ - previous_ll_).abs() / (-previous_ll_) < r_precision
+            {
+                converging = false;
+            } else if step_size <= 0.00001 {
+                converging = false;
+            } else if i >= max_iter {
+                converging = false;
+            } else if newton_decrement < precision {
+                converging = false;
+            }
+
+            previous_ll_ = ll_;
+            step_sizer.update(norm_delta);
+            step_size = step_sizer.next();
         }
 
-        // Add L1 and L2 penalties
-        let l1_penalty = param.mapv(f64::abs).sum();
-        let l2_penalty = param.dot(param);
-
-        let penalty_term = self.args.penalizer
-            * ((1.0 - self.args.l1_ratio) / 2.0 * l2_penalty + self.args.l1_ratio * l1_penalty);
-
-        Ok(neg_log_likelihood + penalty_term)
+        (beta, ll_, hessian)
     }
-}
 
-// 2. Implement the Gradient trait
-impl<'a> Gradient for CoxPHFitter<'a> {
-    type Param = Array1<f64>;
-    type Gradient = Array1<f64>; // Output type for gradient is usually the same as Param
-
-    fn gradient(&self, param: &Self::Param) -> Result<Self::Gradient> {
-        let time_to_event = self.time_to_event.as_ref().unwrap();
-        let event_indicator = self.event_indicator.as_ref().unwrap();
-        let covariates_matrix = self.covariates_matrix.as_ref().unwrap();
-
-        let num_observations = time_to_event.len();
-        let num_covariates = param.len();
-        let mut grad = Array1::zeros(num_covariates);
-
-        let mut sorted_indices: Vec<usize> = (0..num_observations).collect();
-        sorted_indices.sort_by(|&a, &b| time_to_event[a].partial_cmp(&time_to_event[b]).unwrap());
-
-        for &i in sorted_indices.iter() {
-            if event_indicator[i] == 1.0 {
-                let current_time = time_to_event[i];
-
-                let risk_set_indices: Vec<usize> = (0..num_observations)
-                    .filter(|&j| time_to_event[j] >= current_time)
-                    .collect();
-
-                let mut sum_exp_beta_x = 0.0;
-                let mut sum_x_exp_beta_x = Array1::zeros(num_covariates);
-
-                for &k_idx in risk_set_indices.iter() {
-                    let exp_beta_x = (covariates_matrix.row(k_idx).dot(param)).exp();
-                    sum_exp_beta_x += exp_beta_x;
-                    sum_x_exp_beta_x += &(covariates_matrix.row(k_idx).to_owned() * exp_beta_x);
-                }
-
-                if sum_exp_beta_x > 0.0 {
-                    let expected_x_in_risk_set = sum_x_exp_beta_x / sum_exp_beta_x;
-                    grad -= &(covariates_matrix.row(i).to_owned() - expected_x_in_risk_set);
-                }
-            }
+    #[inline]
+    pub fn new(args: CoxPHFitterArgs<'a>) -> Self {
+        Self {
+            args,
+            time_to_event: None,
+            event_indicator: None,
+            covariates_matrix: None,
+            sorted_original_indices: None,
         }
-
-        // L1 regularization adds signum of parameter
-        let l1_grad = param.mapv(f64::signum);
-        let l2_grad = 2.0 * param;
-
-        let penalty_grad = self.args.penalizer
-            * ((1.0 - self.args.l1_ratio) / 2.0 * l2_grad + self.args.l1_ratio * l1_grad);
-        grad += &penalty_grad;
-
-        Ok(grad)
     }
-}
 
-// 3. Implement the Hessian trait
-impl<'a> Hessian for CoxPHFitter<'a> {
-    type Param = Array1<f64>;
-    type Hessian = Array2<f64>; // Output type for Hessian is Array2
+    /// Fit the model. We use Efron's approximation that produces results closer to the exact combinatoric solution
+    /// than Breslow's.
+    pub fn fit(&self, df: &DataFrame) -> Result<CoxPHResults> {
+        let cox_df = self.preprocess(df)?;
 
-    fn hessian(&self, param: &Self::Param) -> Result<Self::Hessian> {
-        let time_to_event = self.time_to_event.as_ref().unwrap();
-        let event_indicator = self.event_indicator.as_ref().unwrap();
-        let covariates_matrix = self.covariates_matrix.as_ref().unwrap();
+        let (beta, ll, hessian) = self.newton_raphson_for_efron_model(
+            &cox_df.covariates,
+            &cox_df.time_array,
+            &cox_df.event_array,
+            &cox_df.weights,
+            0.95,
+            1e-07,
+            1e-9,
+            self.args.max_iter,
+        );
 
-        let num_observations = time_to_event.len();
-        let num_covariates = param.len();
-        let mut hess = Array2::zeros((num_covariates, num_covariates));
+        println!("results: {beta}, {ll}, {hessian}");
 
-        let mut sorted_indices: Vec<usize> = (0..num_observations).collect();
-        sorted_indices.sort_by(|&a, &b| time_to_event[a].partial_cmp(&time_to_event[b]).unwrap());
-
-        for &i in sorted_indices.iter() {
-            if event_indicator[i] == 1.0 {
-                let current_time = time_to_event[i];
-                let risk_set_indices: Vec<usize> = (0..num_observations)
-                    .filter(|&j| time_to_event[j] >= current_time)
-                    .collect();
-
-                let mut sum_exp_beta_x = 0.0;
-                let mut sum_x_exp_beta_x = Array1::zeros(num_covariates);
-                let mut sum_xxT_exp_beta_x = Array2::zeros((num_covariates, num_covariates));
-
-                for &k_idx in risk_set_indices.iter() {
-                    let x_k: ArrayView1<f64> = covariates_matrix.row(k_idx); // Use ArrayView1 for efficiency
-                    let exp_beta_x = (x_k.dot(param)).exp();
-                    sum_exp_beta_x += exp_beta_x;
-                    sum_x_exp_beta_x += &(x_k.to_owned() * exp_beta_x);
-                    sum_xxT_exp_beta_x +=
-                        &(x_k.insert_axis(Axis(1)).dot(&x_k.insert_axis(Axis(0))) * exp_beta_x);
-                }
-
-                if sum_exp_beta_x > 0.0 {
-                    let expected_x = sum_x_exp_beta_x / sum_exp_beta_x;
-                    let expected_xxT = sum_xxT_exp_beta_x / sum_exp_beta_x;
-
-                    let outer_product_of_expected_x = expected_x
-                        .clone()
-                        .insert_axis(Axis(1))
-                        .dot(&expected_x.insert_axis(Axis(0)));
-                    hess += &(expected_xxT - outer_product_of_expected_x);
-                }
-            }
-        }
-        // Add L2 penalty part to Hessian (second derivative of 0.5 * penalizer * l2_penalty * beta^2)
-        let l2_hess =
-            Array2::eye(num_covariates) * (self.args.penalizer * (1.0 - self.args.l1_ratio));
-        hess += &l2_hess;
-
-        Ok(hess)
+        todo!()
     }
-}
-
-impl<'a> Jacobian for CoxPHFitter<'a> {
-    // Not used for this type of problem
-    type Jacobian = ();
-    type Param = Array1<f64>;
-
-    fn jacobian(&self, _param: &Self::Param) -> Result<Self::Jacobian> {
-        Ok(())
-    }
-}
-
-/// Represents the fitted Cox Proportional Hazards Model results.
-#[derive(Default, Debug)]
-pub struct CoxPHResults {
-    pub coefficients: Array1<f64>,
-    pub hazard_ratios: Array1<f64>,
-    pub standard_errors: Array1<f64>,
-    pub p_values: Array1<f64>,
-    pub log_likelihood: f64,
-    pub num_iterations: u64,
-    pub convergence_succeeded: bool,
-    pub covariate_names: Vec<String>,
-    pub final_log_likelihood: f64,
-    // You might also store the baseline hazard/survival function here
-    // pub baseline_hazard: Vec<(f64, f64)>, // (time, hazard)
-    // pub baseline_survival: Vec<(f64, f64)>, // (time, survival_probability)
 }
 
 #[cfg(test)]
 mod test {
-    use polars::prelude::LazyFrame;
-
     use super::*;
 
-    const TEST_DF_PATH: &str = "./data/cox_data.parquet";
-
     #[test]
-    fn test_fit() {
-        let args = CoxPHFitterArgs::default()
-            .set_event_col("event")
-            .set_duration_col("T")
-            .set_penalizer(0.1)
-            .set_robust(true);
-        let mut fitter = CoxPHFitter::new(args);
-
-        // Load a test DataFrame (this is a placeholder, replace with actual DataFrame loading logic)
-        let df = LazyFrame::scan_parquet(TEST_DF_PATH, Default::default())
+    fn test_coxphfitter() {
+        let data = LazyFrame::scan_parquet("./data/cox_data.parquet", Default::default())
             .unwrap()
             .collect()
             .unwrap();
 
-        // Fit the Cox proportional hazards model
-        let result = fitter.fit(&df);
+        let args = CoxPHFitterArgs::default()
+            .set_duration_col("T")
+            .set_event_col("event")
+            .set_penalizer(0.1)
+            .set_robust(true);
 
-        assert!(
-            result.is_ok(),
-            "Failed to fit CoxPHFitter: {:?}",
-            result.err()
-        );
-
-        println!("Fitted CoxPHFitter successfully: {:#?}", result.unwrap());
+        let cph = CoxPHFitter::new(args);
+        cph.fit(&data).unwrap();
     }
 }
