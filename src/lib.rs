@@ -8,12 +8,37 @@
 pub(crate) mod math;
 
 use anyhow::{anyhow, Result};
-use math::{elastic_net_penalty, StepSizer};
+use math::{
+    elastic_net_penalty, elementwise_grad_elastic_net_penalty,
+    elementwise_hessian_diag_elastic_net_penalty, StepSizer,
+};
 use ndarray::prelude::*;
 use ndarray_einsum_beta::einsum;
 use ndarray_linalg::*;
 use polars::frame::DataFrame;
 use polars::prelude::*;
+
+/// Normalize numeric columns in a Polars DataFrame for all numerial columns.
+pub fn normalize_dataframe(df: &DataFrame) -> PolarsResult<DataFrame> {
+    let expr = df
+        .schema()
+        .iter()
+        .filter_map(|c| {
+            if DataType::is_numeric(c.1) {
+                Some(
+                    ((col(c.0.as_str()).cast(DataType::Float64)
+                        - col(c.0.as_str()).cast(DataType::Float64).mean())
+                        / col(c.0.as_str()).cast(DataType::Float64).std(0))
+                    .alias(c.0.as_str()),
+                )
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    df.clone().lazy().with_columns(&expr).collect()
+}
 
 #[derive(Debug, Clone)]
 pub struct Coefficient {
@@ -127,12 +152,6 @@ impl<'a> Default for CoxPHFitterArgs<'a> {
 #[derive(Debug, Clone)]
 pub struct CoxPHFitter<'a> {
     args: CoxPHFitterArgs<'a>,
-    time_to_event: Option<Array1<f64>>,
-    event_indicator: Option<Array1<f64>>, // Should store bool or 0/1
-    covariates_matrix: Option<Array2<f64>>,
-    // Store sorted indices and original data to avoid repeated sorting if data doesn't change
-    // These would be populated during a `preprocess` step or at the start of `fit`
-    sorted_original_indices: Option<Vec<usize>>,
 }
 
 /// Represents the fitted Cox Proportional Hazards Model results.
@@ -151,6 +170,7 @@ pub struct CoxPHResults {
     pub final_log_likelihood: f64,   // Kept for compatibility, same as log_likelihood
 }
 
+#[derive(Debug)]
 pub struct CoxProcessedDf {
     /// The time to event column, converted to an Array1<f64>
     time_array: Array1<f64>,
@@ -163,9 +183,10 @@ pub struct CoxProcessedDf {
 }
 
 impl<'a> CoxPHFitter<'a> {
+    /// Preprocess the dataframe by first sorting it and then extract the data we need.
     fn preprocess(&self, df: &DataFrame) -> Result<CoxProcessedDf> {
         let df = df.sort(
-            [self.args.duration_col],
+            [self.args.duration_col, self.args.event_col],
             SortMultipleOptions::new().with_order_descending(false),
         )?;
 
@@ -185,8 +206,9 @@ impl<'a> CoxPHFitter<'a> {
             .i32()?
             .into_no_null_iter()
             .collect::<Array1<i32>>();
-        let covariates = df
-            .drop_many(&[self.args.duration_col, self.args.event_col])
+        let covariates =
+            normalize_dataframe(&df.drop_many(&[self.args.duration_col, self.args.event_col]))?;
+        let covariates = covariates
             .to_ndarray::<Float64Type>(IndexOrder::Fortran)?
             .into_shape((df.height(), df.width() - 2))
             .map_err(|e| anyhow!("Failed to convert DataFrame to 2D ndarray: {}", e))?;
@@ -220,6 +242,7 @@ impl<'a> CoxPHFitter<'a> {
         beta: &Array1<f64>,
     ) -> (Array2<f64>, Array1<f64>, f64) {
         let shape = X.shape();
+
         let (n, d) = (shape[0], shape[1]);
         let mut hessian = Array2::<f64>::zeros((d, d));
         let mut gradient = Array1::<f64>::zeros(d);
@@ -241,7 +264,7 @@ impl<'a> CoxPHFitter<'a> {
         // let mut phi_x_x_i = Array2::<f64>::zeros((d, d));
 
         // Iterate backwards to utilize recursive relationship
-        for i in n - 1..=0 {
+        for i in (0..n).rev() {
             let ti = T[i];
             let ei = E[i];
             let xi = X.row(i);
@@ -308,7 +331,7 @@ impl<'a> CoxPHFitter<'a> {
                 let summand = numer * &denom.clone().insert_axis(Axis(1));
                 let a2 = summand.t().dot(&summand);
 
-                gradient = gradient + &x_death_sum - weighted_average * summand.sum();
+                gradient = gradient + &x_death_sum - weighted_average * summand.sum_axis(Axis(0));
                 log_lik = log_lik
                     + x_death_sum.dot(beta)
                     + weighted_average * &denom.mapv(|v| v.ln()).sum();
@@ -364,7 +387,8 @@ impl<'a> CoxPHFitter<'a> {
             i += 1;
 
             // Because we do not have strata, we can directly get gradient from X, T, E, weights, entries, and beta.
-            let (h, g, ll__) = self.get_efron_values(X, T, E, weights, &beta);
+            // Buggy.
+            let (mut h, mut g, ll__) = self.get_efron_values(X, T, E, weights, &beta);
             ll_ = ll__;
 
             if self.args.penalizer > 0.0 {
@@ -375,11 +399,24 @@ impl<'a> CoxPHFitter<'a> {
                     self.args.penalizer,
                     self.args.l1_ratio,
                 );
-                // g -= d_elastic_net_penalty(beta, 1.3**i)
-                // h[np.diag_indices(d)] -= dd_elastic_net_penalty(beta, 1.3**i)
+                g -= &elementwise_grad_elastic_net_penalty(
+                    &beta,
+                    1.3f64.powf(i as _),
+                    n as _,
+                    self.args.penalizer,
+                    self.args.l1_ratio,
+                );
+                let h_penalty = elementwise_hessian_diag_elastic_net_penalty(
+                    &beta,
+                    1.3f64.powf(i as _),
+                    n as _,
+                    self.args.penalizer,
+                    self.args.l1_ratio,
+                );
+                h.diag_mut().zip_mut_with(&h_penalty, |a, b| {
+                    *a -= b;
+                });
             }
-
-            
 
             let inv_h_dot_g_T = (-&h).solve(&g).unwrap();
             delta = inv_h_dot_g_T.clone();
@@ -416,13 +453,7 @@ impl<'a> CoxPHFitter<'a> {
 
     #[inline]
     pub fn new(args: CoxPHFitterArgs<'a>) -> Self {
-        Self {
-            args,
-            time_to_event: None,
-            event_indicator: None,
-            covariates_matrix: None,
-            sorted_original_indices: None,
-        }
+        Self { args }
     }
 
     /// Fit the model. We use Efron's approximation that produces results closer to the exact combinatoric solution
@@ -441,9 +472,12 @@ impl<'a> CoxPHFitter<'a> {
             self.args.max_iter,
         );
 
-        println!("results: {beta}, {ll}, {hessian}");
-
-        todo!()
+        Ok(CoxPHResults {
+            coefficients: beta,
+            log_likelihood: ll,
+            final_log_likelihood: ll,
+            ..Default::default()
+        })
     }
 }
 
@@ -465,6 +499,10 @@ mod test {
             .set_robust(true);
 
         let cph = CoxPHFitter::new(args);
-        cph.fit(&data).unwrap();
+        let res = cph.fit(&data);
+
+        assert!(res.is_ok());
+
+        println!("res => {res:#?}");
     }
 }

@@ -8,9 +8,11 @@ doctest = false
 
 [dependencies]
 polars = { git = "https://github.com/hiroki-chen/polars.git", default-features = false, features = [
+  "fmt",
   "lazy",
   "ndarray",
   "parquet",
+  "dtype-decimal",
 ] }
 anyhow = "1.0.98"
 # Lock to "0.15.6" since polars are using this to avoid breaking changes.
@@ -26,3 +28,6 @@ ndarray_einsum_beta = "0.7.0"
 # O3 for debugging
 [profile.dev]
 opt-level = 3
+
+[dev-dependencies]
+approx = "*"

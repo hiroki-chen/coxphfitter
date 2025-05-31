@@ -84,6 +84,11 @@ pub fn stable_softplus_element(val: f64) -> f64 {
 ///
 /// # Panics
 /// Panics if `a` is `0.0`.
+///
+/// # Note
+///
+/// The first derivative of this function is $\tanh(\dfrac{ax}{2})$. The second derivative of this
+/// function is thus $\dfrac{a}{\cosh(ax) + 1}$.
 pub fn soft_abs<S, D>(x: &ArrayBase<S, D>, a: f64) -> Array<f64, D>
 where
     S: Data<Elem = f64>,
@@ -156,6 +161,95 @@ where
 
     // 6. Final multiplication by n_samples: n * (...)
     n_samples * sum_of_penalties
+}
+
+/// Computes the first derivative of `soft_abs(x, a_param)` w.r.t. `x`.
+/// Formula: `tanh(a_param * x / 2.0)`.
+/// Assumes `a_param != 0.0` (as per panic in `soft_abs`).
+///
+#[inline]
+fn deriv_soft_abs_val_user_defined(beta_val: f64, a_param: f64) -> f64 {
+    debug_assert!(a_param != 0.0, "a_param (a_smoothness) must be non-zero.");
+    (a_param * beta_val / 2.0).tanh()
+}
+
+/// Computes the second derivative of `soft_abs(x, a_param)` w.r.t. `x`.
+/// Formula: `(a_param / 2.0) * sech^2(a_param * x / 2.0)`.
+/// Assumes `a_param != 0.0`.
+///
+/// https://www.wolframalpha.com/input?i=second+derivative+of+1/a+*+(ln(1+++e%5E%7Bax%7D)+++ln(1+++e%5E%7B-ax%7D))+for+x
+#[inline]
+fn second_deriv_soft_abs_val_user_defined(beta_val: f64, a_param: f64) -> f64 {
+    debug_assert!(a_param != 0.0, "a_param (a_smoothness) must be non-zero.");
+    a_param / ((a_param * beta_val).cosh() + 1.0)
+}
+
+/// Computes the element-wise gradient of the elastic_net_penalty function.
+/// This corresponds to the gradient vector dP/d(beta_i).
+pub fn elementwise_grad_elastic_net_penalty<S, D>(
+    beta: &ArrayBase<S, D>,
+    a_smoothness: f64, // This is `a_param` for the derivative helpers
+    n_samples: f64,
+    penalty_strength: f64,
+    l1_ratio: f64,
+) -> Array<f64, D>
+where
+    S: Data<Elem = f64>,
+    D: Dimension,
+{
+    let common_factor = n_samples * penalty_strength;
+    if common_factor == 0.0 || common_factor.is_nan() {
+        return Array::zeros(beta.raw_dim());
+    }
+    if a_smoothness == 0.0 {
+        // This case should ideally be prevented by a panic in soft_abs if called directly,
+        // but if elastic_net_penalty is called with a_smoothness = 0 and somehow soft_abs isn't directly invoked
+        // or if we want to be extra safe before calling derivative helpers.
+        // However, soft_abs itself will panic if a_smoothness is 0.
+        // The `debug_assert` in derivative helpers also checks this.
+        // If `elastic_net_penalty` were to call `soft_abs` which panics, this function wouldn't proceed.
+        // Thus, `a_smoothness` will be non-zero when `deriv_soft_abs_val_user_defined` is called.
+    }
+
+    beta.mapv(|b_val| {
+        // Derivative of: l1_ratio * soft_abs(b_val, a_smoothness)
+        let l1_grad = l1_ratio * deriv_soft_abs_val_user_defined(b_val, a_smoothness);
+
+        // Derivative of: 0.5 * (1 - l1_ratio) * b_val^2
+        let l2_grad = (1.0 - l1_ratio) * b_val;
+
+        common_factor * (l1_grad + l2_grad)
+    })
+}
+
+/// Computes the "elementwise_grad on elementwise_grad" of the elastic_net_penalty.
+/// This corresponds to the diagonal of the Hessian matrix: d^2P/d(beta_i)^2.
+pub fn elementwise_hessian_diag_elastic_net_penalty<S, D>(
+    beta: &ArrayBase<S, D>,
+    a_smoothness: f64, // This is `a_param` for the derivative helpers
+    n_samples: f64,
+    penalty_strength: f64,
+    l1_ratio: f64,
+) -> Array<f64, D>
+where
+    S: Data<Elem = f64>,
+    D: Dimension,
+{
+    let common_factor = n_samples * penalty_strength;
+    if common_factor == 0.0 || common_factor.is_nan() {
+        return Array::zeros(beta.raw_dim());
+    }
+    // Similar to the first gradient function, a_smoothness is expected to be non-zero here.
+
+    beta.mapv(|b_val| {
+        // Second derivative of: l1_ratio * soft_abs(b_val, a_smoothness)
+        let l1_hess_diag = l1_ratio * second_deriv_soft_abs_val_user_defined(b_val, a_smoothness);
+
+        // Second derivative of: 0.5 * (1 - l1_ratio) * b_val^2
+        let l2_hess_diag = 1.0 - l1_ratio; // d/db_val of ((1-l1_ratio)*b_val)
+
+        common_factor * (l1_hess_diag + l2_hess_diag)
+    })
 }
 
 /// This class abstracts complicated step size logic out of the fitters.
@@ -315,5 +409,46 @@ mod tests {
         assert_eq!(result.nrows(), 0);
         assert_eq!(result.ncols(), 0);
         assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn test_elastic_net() {
+        let beta = arr1(&[1.0, 2.0, 3.0]);
+        let a = 0.05;
+        let n = beta.len();
+        let penalty = 0.1;
+        let l1_ratio = 0.5;
+
+        approx::assert_abs_diff_eq!(
+            13.55288,
+            elastic_net_penalty(&beta, a, n as _, penalty, l1_ratio),
+            epsilon = 1e-6
+        );
+    }
+
+    #[test]
+    fn test_first_deriv_soft_abs() {
+        let x = 5.0;
+        let a = 0.05;
+
+        let first_deriv = deriv_soft_abs_val_user_defined(x, a);
+        let second_deriv = second_deriv_soft_abs_val_user_defined(x, a);
+
+        approx::assert_abs_diff_eq!(0.124353, first_deriv, epsilon = 1e-6);
+        approx::assert_abs_diff_eq!(0.0246134, second_deriv, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn test_elementwise_grad_elastic_net() {
+        let beta = arr1(&[1.0, 2.0, 3.0]);
+        let a = 0.05;
+        let n = beta.len();
+        let penalty = 0.1;
+        let l1_ratio = 0.5;
+
+        let d = elementwise_grad_elastic_net_penalty(&beta, a, n as _, penalty, l1_ratio);
+        let dd = elementwise_hessian_diag_elastic_net_penalty(&beta, a, n as _, penalty, l1_ratio);
+        assert!(d.abs_diff_eq(&arr1(&[0.15374922, 0.30749376, 0.46122895]), 1e-6));
+        assert!(dd.abs_diff_eq(&arr1(&[0.15374766, 0.15374064, 0.15372899]), 1e-6));
     }
 }
