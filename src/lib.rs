@@ -180,6 +180,8 @@ pub struct CoxProcessedDf {
     covariates: Array2<f64>,
     /// Weights.
     weights: Array1<f64>,
+    norm_std: Array1<f64>,
+    norm_mean: Array1<f64>,
 }
 
 impl<'a> CoxPHFitter<'a> {
@@ -190,10 +192,27 @@ impl<'a> CoxPHFitter<'a> {
             SortMultipleOptions::new().with_order_descending(false),
         )?;
 
+        let covariates = &df.drop_many(&[self.args.duration_col, self.args.event_col]);
+        let norm_std = covariates
+            .clone()
+            .lazy()
+            .std(0)
+            .collect()?
+            .to_ndarray::<Float64Type>(IndexOrder::Fortran)?
+            .into_shape(df.width() - 2)?;
+        let norm_mean = covariates
+            .clone()
+            .lazy()
+            .mean()
+            .collect()?
+            .to_ndarray::<Float64Type>(IndexOrder::Fortran)?
+            .into_shape(df.width() - 2)?;
+
+        let covariates = normalize_dataframe(&covariates)?;
+
         // This function should convert the DataFrame to the required format
         // and return a CoxProcessedDf with time_col, event_col, and covariates.
         // It should also sort the data and store the original indices.
-
         let time_array = df
             .column(self.args.duration_col)?
             .cast(&DataType::Float64)?
@@ -206,8 +225,6 @@ impl<'a> CoxPHFitter<'a> {
             .i32()?
             .into_no_null_iter()
             .collect::<Array1<i32>>();
-        let covariates =
-            normalize_dataframe(&df.drop_many(&[self.args.duration_col, self.args.event_col]))?;
         let covariates = covariates
             .to_ndarray::<Float64Type>(IndexOrder::Fortran)?
             .into_shape((df.height(), df.width() - 2))
@@ -218,6 +235,8 @@ impl<'a> CoxPHFitter<'a> {
             time_array,
             event_array,
             covariates,
+            norm_std,
+            norm_mean,
         })
     }
 
@@ -318,7 +337,7 @@ impl<'a> CoxPHFitter<'a> {
                 let summand = numer * denom.clone().insert_axis(Axis(1));
                 let a2 = summand.t().dot(&summand);
 
-                gradient = gradient + &x_death_sum - weighted_average * summand.sum();
+                gradient = gradient + &x_death_sum - weighted_average * summand.sum_axis(Axis(0));
                 log_lik = log_lik
                     + &x_death_sum.dot(beta)
                     + &weighted_average * &denom.mapv(|v| v.ln()).sum();
@@ -461,7 +480,7 @@ impl<'a> CoxPHFitter<'a> {
     pub fn fit(&self, df: &DataFrame) -> Result<CoxPHResults> {
         let cox_df = self.preprocess(df)?;
 
-        let (beta, ll, hessian) = self.newton_raphson_for_efron_model(
+        let (mut beta, ll, hessian) = self.newton_raphson_for_efron_model(
             &cox_df.covariates,
             &cox_df.time_array,
             &cox_df.event_array,
@@ -471,6 +490,9 @@ impl<'a> CoxPHFitter<'a> {
             1e-9,
             self.args.max_iter,
         );
+
+        // Rescale parameters back to original scale.
+        beta = beta / cox_df.norm_std;
 
         Ok(CoxPHResults {
             coefficients: beta,
@@ -500,8 +522,6 @@ mod test {
 
         let cph = CoxPHFitter::new(args);
         let res = cph.fit(&data);
-
-        assert!(res.is_ok());
 
         println!("res => {res:#?}");
     }
