@@ -5,6 +5,7 @@ edition = "2021"
 
 [lib]
 doctest = false
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 polars = { git = "https://github.com/hiroki-chen/polars.git", default-features = false, features = [
