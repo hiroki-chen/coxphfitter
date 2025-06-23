@@ -13,7 +13,7 @@ polars = { git = "https://github.com/hiroki-chen/polars.git", default-features =
   "ndarray",
   "parquet",
   "dtype-decimal",
-] }
+], rev="cbdb9b" }
 anyhow = "1.0.98"
 # Lock to "0.15.6" since polars are using this to avoid breaking changes.
 ndarray = { version = "0.15.6", features = ["approx"] }
