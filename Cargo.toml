@@ -9,16 +9,22 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 polars = { git = "https://github.com/hiroki-chen/polars.git", default-features = false, features = [
-  "lazy",
-  "ndarray",
-  "parquet",
-  "dtype-decimal",
-], rev="cbdb9b" }
+    "lazy",
+    "ndarray",
+    "parquet",
+    "dtype-decimal",
+], rev = "cbdb9b" }
 anyhow = "1.0.98"
 # Lock to "0.15.6" since polars are using this to avoid breaking changes.
 ndarray = { version = "0.15.6", features = ["approx"] }
-ndarray-linalg = { version = "0.15" }
 ndarray_einsum_beta = "0.7.0"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+nalgebra = "0.33.2"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ndarray-linalg = { version = "0.15" }
+lax = { version = "0.15" }
 
 # O3 for debugging
 [profile.dev]

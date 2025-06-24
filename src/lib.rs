@@ -10,11 +10,10 @@ pub(crate) mod math;
 use anyhow::{anyhow, Result};
 use math::{
     elastic_net_penalty, elementwise_grad_elastic_net_penalty,
-    elementwise_hessian_diag_elastic_net_penalty, StepSizer,
+    elementwise_hessian_diag_elastic_net_penalty, norm, solve, StepSizer,
 };
 use ndarray::prelude::*;
 use ndarray_einsum_beta::einsum;
-use ndarray_linalg::*;
 use polars::frame::DataFrame;
 use polars::prelude::*;
 
@@ -437,13 +436,13 @@ impl<'a> CoxPHFitter<'a> {
                 });
             }
 
-            let inv_h_dot_g_T = (-&h).solve(&g).unwrap();
+            let inv_h_dot_g_T = solve(-&h, &g).unwrap();
             delta = inv_h_dot_g_T.clone();
 
             // save these as pending result
             hessian = h.clone();
 
-            let norm_delta = if delta.len() > 0 { delta.norm() } else { 0.0 };
+            let norm_delta = if delta.len() > 0 { norm(&delta) } else { 0.0 };
 
             // reusing an above piece to make g * inv(h) * g.T faster.
             let newton_decrement = g.dot(&inv_h_dot_g_T) / 2.0;

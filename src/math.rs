@@ -1,6 +1,92 @@
 use ndarray::*;
 use std::ops::Mul;
 
+// /// This function is just a proxy to `ndarray_linalg::Solve::solve`.
+// ///
+// /// This is because if we target `wasm32`, we cannot use `ndarray_linalg`
+// /// due to missing backend LAPACK support.
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+pub fn solve<S, A>(a: ArrayBase<S, Ix2>, b: &ArrayBase<S, Ix1>) -> ndarray_linalg::error::Result<Array1<A>>
+where
+    A: ndarray_linalg::Scalar + lax::Lapack,
+    S: Data<Elem = A>,
+{
+    use ndarray_linalg::Solve;
+    // Use ndarray's built-in solve function to solve the linear system Ax = b
+    a.solve(b)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+pub fn norm<S, D, A>(a: &ArrayBase<S, D>) -> A::Real
+where
+    A: ndarray_linalg::Scalar + lax::Lapack,
+    S: Data<Elem = A>,
+    D: Dimension,
+{
+    use ndarray_linalg::Norm;
+    // Use ndarray's built-in norm function to compute the norm of the array
+    a.norm()
+}
+
+/// For `wasm32` targets, we instead use a pure Rust-based linear solver.
+#[cfg(target_arch = "wasm32")]
+pub fn solve<S>(a: ArrayBase<S, Ix2>, b: &ArrayBase<S, Ix1>) -> Result<Array1<f64>, String>
+where
+    S: Data<Elem = f64>,
+{
+    use nalgebra::*;
+
+    let a_dim = a.dim();
+    let (rows, cols) = (a_dim.0, a_dim.1);
+
+    // Use a pure Rust-based linear solver for wasm32 targets
+    // ndarray arrays are row-major by default. nalgebra matrices are column-major.
+    // `DMatrix::from_row_slice` correctly handles this conversion.
+    // We must ensure the ndarray data is contiguous in memory to get a slice.
+    let a_slice = a
+        .as_slice()
+        .ok_or("Input matrix 'a' is not contiguous in memory.")?;
+    let na_a = DMatrix::from_row_slice(rows, cols, a_slice);
+
+    let b_slice = b
+        .as_slice()
+        .ok_or("Input vector 'b' is not contiguous in memory.")?;
+    let na_b = DVector::from_vec(b_slice.to_vec());
+
+    // `na_a.lu()` computes the LU decomposition of the matrix 'a'.
+    // `solve()` then uses this decomposition to find 'x'.
+    // `solve()` returns `Some(solution)` if successful and `None` if the matrix is singular.
+    match na_a.lu().solve(&na_b) {
+        Some(solution) => {
+            // --- 4. Convert the nalgebra result back to an ndarray::Array1 ---
+            let x = Array1::from_vec(solution.as_slice().to_vec());
+            Ok(x)
+        }
+        None => {
+            // This occurs if the matrix 'a' is singular (i.e., its determinant is zero)
+            // and cannot be inverted.
+            Err("Failed to solve the linear system. The matrix is likely singular.".to_string())
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn norm<S, D>(a: &ArrayBase<S, D>) -> f64
+where
+    S: Data<Elem = f64>,
+    D: Dimension,
+{
+    // Use a pure Rust-based norm calculation for wasm32 targets
+    // This is a placeholder; you would need to implement or use an existing library
+    // that provides a norm calculation compatible with wasm32.
+    a.mapv(|x| x * x).sum().sqrt()
+}
+
+/// Computes the element-wise exponential of an ndarray.
+///
+/// Equivalent to Python: `np.exp(x)`
 #[inline]
 pub fn exp<S, D>(x: &ArrayBase<S, D>) -> Array<f64, D>
 where
